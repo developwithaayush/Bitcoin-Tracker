@@ -37,7 +37,8 @@ def explode(df: pd.DataFrame):
     Everything downstream is a groupby over these two frames rather than a graph walk,
     which keeps feature extraction linear in the number of transaction legs.
     """
-    meta = ["txid", "timestamp", "src_ip", "src_port", "geo_country", "asn", "fee"]
+    meta = ["txid", "timestamp", "src_ip", "src_port", "dst_ip", "dst_port",
+            "script_type", "geo_country", "asn", "fee"]
     ins = df[meta + ["input_addresses", "input_amounts"]].copy()
     ins["address"] = ins.pop("input_addresses")
     ins["amount"] = ins.pop("input_amounts")
@@ -360,7 +361,8 @@ def wallet_features(df: pd.DataFrame) -> pd.DataFrame:
     # the shared-host signal by giving every payment recipient its payer's network
     # footprint. Wallets that only ever received therefore have no network features, which
     # is the honest answer rather than a borrowed one.
-    net = ins[["address", "src_ip", "geo_country", "asn", "src_port", "timestamp"]]
+    net = ins[["address", "src_ip", "dst_ip", "dst_port", "script_type",
+               "geo_country", "asn", "src_port", "timestamp"]]
     ng = net.groupby("address")
     f["n_ips"] = ng["src_ip"].nunique().reindex(addresses).fillna(0)
     f["n_countries"] = ng["geo_country"].nunique().reindex(addresses).fillna(0)
@@ -377,6 +379,31 @@ def wallet_features(df: pd.DataFrame) -> pd.DataFrame:
         .reindex(addresses).fillna(0.0)
     )
     f["ip_cohort_components"] = _ip_cohort_components(df, ins, addresses)
+    # How many distinct peers does this wallet's busiest host dial out to? An ordinary node
+    # keeps a small, stable peer set; a host flooding the network to announce wallets it
+    # does not own keeps a wide one. Exchanges are deliberately wide too, so this is
+    # corroborating evidence rather than a tell on its own.
+    peers_per_ip = net.groupby("src_ip")["dst_ip"].nunique()
+    f["host_peer_fanout"] = (
+        net.assign(fanout=net["src_ip"].map(peers_per_ip))
+        .groupby("address")["fanout"].max().reindex(addresses).fillna(0.0)
+    )
+    # Automated wallet software mints every address with one script type, so an operation
+    # driven by a single tool is script-monotone where an ordinary user's host is mixed.
+    # Dominant share rather than a distinct count: a host seen once is trivially monotone
+    # on a count, which would make this a restatement of host activity.
+    purity = net.groupby("src_ip")["script_type"].agg(
+        lambda s: s.value_counts().iloc[0] / len(s))
+    f["host_script_purity"] = (
+        net.assign(purity=net["src_ip"].map(purity))
+        .groupby("address")["purity"].max().reindex(addresses).fillna(0.0)
+    )
+    # Relaying to a non-standard destination port means the peer is not a public node --
+    # private infrastructure. Symmetric to nonstd_port_frac on the source side.
+    f["nonstd_dst_port_frac"] = (
+        net.assign(nonstd=net["dst_port"].ne(8333))
+        .groupby("address")["nonstd"].mean().reindex(addresses).fillna(0.0)
+    )
     # Countries touched per active day -- a wallet legitimately moves, but not this fast.
     f["geo_hop_rate"] = f["n_countries"] / f["lifetime_days"].clip(lower=1.0)
 

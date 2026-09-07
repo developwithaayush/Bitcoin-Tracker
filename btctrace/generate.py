@@ -59,6 +59,14 @@ class Actor:
     kind: str
     wallets: list = field(default_factory=list)
     ips: list = field(default_factory=list)  # list of (ip, country, asn)
+    # Peers this actor dials out to. A real node keeps a small, fairly stable peer set;
+    # a host flooding the network to announce many wallets keeps a large one, which is
+    # what makes dst_ip a network-layer signal rather than decoration.
+    peers: list = field(default_factory=list)  # list of dst_ip strings
+    # Automated wallet software emits one script type for everything it generates, so an
+    # operation run by one tool is script-monotone where an ordinary user is not.
+    script: str | None = None
+    relay_port: int | None = None  # non-standard port => private relay infrastructure
 
 
 class Generator:
@@ -138,12 +146,17 @@ class Generator:
             v = r.uniform(lo, hi)
         return round(v, SATOSHI_DP)
 
-    def _actor(self, kind, n_wallets, n_ips=1, evasive=False) -> Actor:
+    def _actor(self, kind, n_wallets, n_ips=1, evasive=False, n_peers=(2, 5),
+               script=None, relay_port=None) -> Actor:
         nets = EVASIVE if evasive else NETWORKS
+        n = self.rng.randint(*n_peers)
         return Actor(
             kind=kind,
-            wallets=[self._addr() for _ in range(n_wallets)],
+            wallets=[self._addr(script) for _ in range(n_wallets)],
             ips=[self._ip(self.rng.choice(nets)) for _ in range(n_ips)],
+            peers=[self._ip()[0] for _ in range(n)],
+            script=script,
+            relay_port=relay_port,
         )
 
     def _label(self, wallets, typology: str) -> None:
@@ -168,20 +181,22 @@ class Generator:
             src_ip, country, asn = actor.ips[r.randrange(len(actor.ips))]
         else:
             src_ip, country, asn = self._ip()
-        dst_ip, _, _ = self._ip()
+        # Before: a fresh random dst_ip per record, which gave every wallet a distinct-peer
+        # count equal to its transaction count -- no signal, just a restatement of degree.
+        dst_ip = r.choice(actor.peers) if actor.peers else self._ip()[0]
         self.records.append({
             "timestamp": int(ts),
             "src_ip": src_ip,
             "dst_ip": dst_ip,
             "src_port": port or r.choice([8333] * 12 + [18333, 9001, 49152, 51413]),
-            "dst_port": 8333,
+            "dst_port": actor.relay_port or 8333,
             "txid": self._txid(),
             "input_addresses": list(in_addrs),
             "output_addresses": list(out_addrs),
             "input_amounts": [round(v, SATOSHI_DP) for v in in_amts],
             "output_amounts": [round(v, SATOSHI_DP) for v in out_amts],
             "fee": fee,
-            "script_type": self._addr_script.get(in_addrs[0], "p2wpkh"),
+            "script_type": self._addr_script.get(in_addrs[0], actor.script or "p2wpkh"),
             "geo_country": country,
             "asn": asn,
         })
@@ -223,7 +238,8 @@ class Generator:
         reused for months, amounts are heterogeneous, and it broadcasts from a stable ASN.
         """
         for _ in range(n_actors):
-            a = self._actor("exchange", 3, n_ips=self.rng.randint(2, 4))
+            a = self._actor("exchange", 3, n_ips=self.rng.randint(2, 4),
+                            n_peers=(10, 22))
             hot = a.wallets[0]
             for _ in range(self.rng.randint(60, 140)):  # deposits: many senders -> hot wallet
                 amt = self._amt(1e-3, 30.0)
@@ -288,20 +304,22 @@ class Generator:
         """A large balance walks down a chain of fresh addresses, shedding a small
         constant payout at each hop and carrying the remainder forward."""
         for _ in range(n_actors):
-            a = self._actor("peel", 0, n_ips=self.rng.randint(1, 3), evasive=True)
+            a = self._actor("peel", 0, n_ips=self.rng.randint(1, 3), evasive=True,
+                            script=self.rng.choice(SCRIPT_TYPES))
             balance = round(self.rng.uniform(8.0, 60.0), SATOSHI_DP)
-            cur = self._addr()
+            cur = self._addr(a.script)
             chain = [cur]
             ts = self._time(self.rng.uniform(0, max(1.0, self.days - 10)))
             peel = round(balance * self.rng.uniform(0.01, 0.04), SATOSHI_DP)
             for _ in range(self.rng.randint(12, 28)):
                 fee = self._fee(1, 2)
-                nxt = self._addr()
+                nxt = self._addr(a.script)
                 remainder = round(balance - peel - fee, SATOSHI_DP)
                 if remainder <= peel:
                     break
                 ts = self._after(ts, 600, 21600)  # hops 10 minutes to 6 hours apart
-                self._emit(ts, a, [cur], [balance], [self._addr(), nxt], [peel, remainder])
+                self._emit(ts, a, [cur], [balance],
+                           [self._addr(a.script), nxt], [peel, remainder])
                 cur, balance = nxt, remainder
                 chain.append(cur)
             self._label(chain, "peeling_chain")
@@ -313,17 +331,19 @@ class Generator:
         uniformity (high) and dwell time (minutes).
         """
         for _ in range(n_actors):
-            a = self._actor("mixer", 1, n_ips=self.rng.randint(2, 5), evasive=True)
+            a = self._actor("mixer", 1, n_ips=self.rng.randint(2, 5), evasive=True,
+                            script=self.rng.choice(SCRIPT_TYPES),
+                            relay_port=self.rng.choice([8333, 8333, 9001, 18333, 51413]))
             source = a.wallets[0]
             n_hops = self.rng.randint(10, 26)
             slice_amt = round(self.rng.uniform(0.2, 2.0), SATOSHI_DP)
             t0 = self._time(self.rng.uniform(0, max(1.0, self.days - 5)))
             funding_fee = self._fee(1, n_hops)
-            inters = [self._addr() for _ in range(n_hops)]
+            inters = [self._addr(a.script) for _ in range(n_hops)]
             self._emit(t0, a, [source],
                        [round(slice_amt * n_hops + funding_fee, SATOSHI_DP)],
                        inters, [slice_amt] * n_hops)
-            sink = self._addr()
+            sink = self._addr(a.script)
             for i in inters:  # each intermediate is used once and abandoned
                 fee = self._fee(1, 1)
                 out = round(slice_amt - fee, SATOSHI_DP)
@@ -353,11 +373,12 @@ class Generator:
         link. Invisible to blockchain-only analysis -- this is the correlation payoff."""
         for _ in range(n_actors):
             ip = self._ip(self.rng.choice(EVASIVE))
+            flood = [self._ip()[0] for _ in range(self.rng.randint(25, 45))]
             controlled = []
             for _ in range(self.rng.randint(12, 30)):
                 w = self._addr()
                 controlled.append(w)
-                sub = Actor(kind="sybil", wallets=[w], ips=[ip])
+                sub = Actor(kind="sybil", wallets=[w], ips=[ip], peers=flood)
                 for _ in range(self.rng.randint(2, 6)):
                     self._payment(sub, self._time(), src_wallet=w)
             self._label(controlled, "sybil_broadcast")
@@ -370,7 +391,8 @@ class Generator:
             ts = self._time(self.rng.uniform(0, max(1.0, self.days - 2)))
             nets = self.rng.sample(NETWORKS, self.rng.randint(6, 11))
             for net in nets:
-                sub = Actor(kind="geohop", wallets=[w], ips=[self._ip(net)])
+                sub = Actor(kind="geohop", wallets=[w], ips=[self._ip(net)],
+                            peers=a.peers)
                 self._payment(sub, ts, src_wallet=w)
                 ts = self._after(ts, 900, 5400)  # continent-hopping within hours
             self._label([w], "geo_hopping")

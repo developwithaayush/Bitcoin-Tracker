@@ -1,0 +1,14 @@
+# Base theme for the btctrace console. The heavy lifting is CSS in app.py; this exists
+# so Streamlit's own widgets (inputs, tables, tabs) start from the same palette instead
+# of fighting it. No font files are referenced -- the stacks in app.py are all system
+# fonts, so the dashboard renders identically on an air-gapped machine.
+[theme]
+base = "light"
+primaryColor = "#2563eb"
+backgroundColor = "#f7f9fb"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#0f172a"
+font = "sans-serif"
+
+[server]
+headless = true
