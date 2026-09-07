@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+vendor/
+data/raw/
+data/geoip/*.mmdb
+data/*.parquet
+data/rejected.csv
+.venv/

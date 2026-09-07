@@ -1,0 +1,12 @@
+# btctrace runtime dependencies.
+# Lower bounds, not pins: these are the versions verified on Python 3.14.7, and the code
+# uses no API newer than them. For a reproducible air-gapped install see README.md.
+pandas>=2.2,<4
+numpy>=1.26,<3
+scikit-learn>=1.4,<2
+pyarrow>=15                # parquet engine for the canonical store
+networkx>=3.2,<4           # entity graph and connected components
+pyvis>=0.3.2,<0.4          # offline link-analysis rendering (vis.js inlined)
+maxminddb>=2.5,<4          # reads the DB-IP / MaxMind .mmdb GeoIP database
+streamlit>=1.35,<2         # dashboard
+altair>=5,<7               # charts inside the dashboard
