@@ -404,4 +404,5 @@ if __name__ == "__main__":
     st.navigation([
         st.Page(main, title="Console", icon="📊", url_path="console", default=True),
         st.Page("pages/wallet_simulator.py", title="Wallet simulator", icon="👛"),
+        st.Page("pages/p2p_broadcast.py", title="P2P broadcast", icon="📡"),
     ]).run()

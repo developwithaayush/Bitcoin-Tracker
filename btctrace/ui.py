@@ -68,7 +68,10 @@ SEVERITY = ((0.85, "Critical", "#d70015"), (0.70, "High", "#c93400"),
 NODE_COLOURS = {"wallet": ACCENT, "subject": RED, "tx": "#6c6c70", "ip": "#c93400"}
 # Edges are lines, not text: they sit lighter than the nodes they join so the nodes stay
 # the figure and the edges the ground.
-EDGE_COLOURS = {"broadcast": "#d9a05b", "in": "#86b0e8", "out": "#6fbf8b"}
+# Money in is green and money out is red, the convention every block explorer uses and
+# the one the P2P broadcast page reads in its tooltips. Both sit lighter than the nodes
+# they join, so an out-edge never competes with the red of the subject wallet itself.
+EDGE_COLOURS = {"broadcast": "#d9a05b", "in": "#6fbf8b", "out": "#e8867f"}
 # The one data neutral: a series that is context rather than subject recedes to it.
 NEUTRAL = "#c7c7cc"
 
