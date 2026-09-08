@@ -130,12 +130,12 @@ with left, card("Unspent outputs"):
         st.dataframe(
             coins.assign(received=pd.to_datetime(coins["ts"], unit="s"),
                          txid=coins["txid"].str.slice(0, 12) + "…",
-                         held_at=coins["address"].str.slice(0, 14) + "…")
+                         held_at=coins["address"])
             .sort_values("ts")[["amount", "held_at", "txid", "received"]],
             hide_index=True, width="stretch", height=min(38 * len(coins) + 40, 230),
             column_config={
                 "amount": st.column_config.NumberColumn("amount (BTC)", format="%.8f"),
-                "held_at": st.column_config.TextColumn("held at", width="small"),
+                "held_at": st.column_config.TextColumn("held at", width="medium"),
                 "txid": st.column_config.TextColumn("from tx", width="small"),
                 "received": st.column_config.DatetimeColumn("received", format="DD MMM HH:mm"),
             })
