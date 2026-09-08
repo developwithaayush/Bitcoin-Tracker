@@ -52,6 +52,60 @@ def corpus_end() -> int:
     return int(pd.Timestamp.utcnow().timestamp())
 
 
+def tx_detail(rec: dict, wallet: Wallet) -> None:
+    """One transaction, the way an explorer shows it -- from what this project records.
+
+    Confirmations, weight, RBF, locktime and fiat value are not modelled anywhere in
+    btctrace, so they are absent rather than invented. Size and fee rate are estimates
+    from the input and output counts at p2wpkh sizing, and say so.
+    """
+    ins, outs = rec["input_amounts"], rec["output_amounts"]
+    spent, paid = sum(ins), sum(outs)
+    ts = pd.to_datetime(rec["timestamp"], unit="s")
+    age = max(wallet.ts - rec["timestamp"], 0)
+    vsize = 68 * len(ins) + 31 * len(outs) + 11
+    sats = round(rec["fee"] * 1e8)
+
+    st.markdown('<div class="bt-split"></div>', unsafe_allow_html=True)
+    strip(
+        cell("Amount", f"{paid:.8f}", "BTC"),
+        cell("Fee", f"{sats:,}", "sats"),
+        cell("From", str(len(ins)), "inputs"),
+        cell("To", str(len(outs)), "outputs"),
+    )
+    st.markdown(
+        '<dl class="bt-dl">'
+        f'<dt>Hash</dt><dd class="mono">{rec["txid"]}</dd>'
+        f'<dt>Broadcast</dt><dd>{ts.strftime("%d %b %Y %H:%M:%S")} UTC</dd>'
+        f'<dt>Age</dt><dd>{age // 3600}h {age % 3600 // 60}m on this wallet’s clock</dd>'
+        f'<dt>Input value</dt><dd>{spent:.8f} BTC</dd>'
+        f'<dt>Output value</dt><dd>{paid:.8f} BTC</dd>'
+        f'<dt>Fee</dt><dd>{rec["fee"]:.8f} BTC</dd>'
+        f'<dt>Size (est.)</dt><dd>{vsize:,} vBytes &middot; {sats / vsize:.3f} sat/vB</dd>'
+        f'<dt>Script type</dt><dd>{esc(rec["script_type"])}</dd>'
+        f'<dt>Broadcast from</dt><dd class="mono">{esc(rec["src_ip"])} '
+        f'&middot; {esc(rec["geo_country"])} &middot; AS{esc(str(rec["asn"]))}</dd>'
+        '</dl>', unsafe_allow_html=True)
+
+    # Marking the wallet's own addresses is the point of showing the legs at all: the
+    # second output of an ordinary payment is the change coming home.
+    for title, addrs, amounts in (("From", rec["input_addresses"], ins),
+                                  ("To", rec["output_addresses"], outs)):
+        st.markdown(f'<p class="bt-h">{title}</p>', unsafe_allow_html=True)
+        legs = pd.DataFrame({
+            "#": range(1, len(addrs) + 1), "address": addrs, "amount": amounts,
+            "owner": ["yours" if a in wallet.addresses else "counterparty" for a in addrs],
+        })
+        st.dataframe(
+            legs, hide_index=True, width="stretch", height=min(38 * len(legs) + 40, 190),
+            column_config={
+                "#": st.column_config.NumberColumn(width="small"),
+                "address": st.column_config.TextColumn(width="large"),
+                "amount": st.column_config.NumberColumn("BTC", format="%.8f"),
+                "owner": st.column_config.TextColumn(width="small"),
+            })
+
+
 def new_wallet() -> Wallet:
     return Wallet(start_ts=corpus_end())
 
@@ -129,14 +183,13 @@ with left, card("Unspent outputs"):
         coins = pd.DataFrame(w.utxos)
         st.dataframe(
             coins.assign(received=pd.to_datetime(coins["ts"], unit="s"),
-                         txid=coins["txid"].str.slice(0, 12) + "…",
                          held_at=coins["address"])
             .sort_values("ts")[["amount", "held_at", "txid", "received"]],
             hide_index=True, width="stretch", height=min(38 * len(coins) + 40, 230),
             column_config={
                 "amount": st.column_config.NumberColumn("amount (BTC)", format="%.8f"),
                 "held_at": st.column_config.TextColumn("held at", width="medium"),
-                "txid": st.column_config.TextColumn("from tx", width="small"),
+                "txid": st.column_config.TextColumn("from tx", width="large"),
                 "received": st.column_config.DatetimeColumn("received", format="DD MMM HH:mm"),
             })
     else:
@@ -165,6 +218,36 @@ with right, card("Activity"):
                      })
     else:
         st.info("No activity yet. Buy some coin, or run one of the demo behaviours.")
+
+with right, card("Transactions"):
+    note("Every record this wallet has broadcast. Select one to open it, the way an "
+         "explorer shows a transaction: what went in, what came out, and which of the "
+         "outputs is the change coming back to an address of yours.")
+    if w.records:
+        txs = pd.DataFrame([{
+            "time": pd.to_datetime(r["timestamp"], unit="s"),
+            "txid": r["txid"],
+            "in": len(r["input_amounts"]),
+            "out": len(r["output_amounts"]),
+            "amount": sum(r["output_amounts"]),
+        } for r in w.records])
+        # Row selection is the click target -- st.dataframe does it natively, so the
+        # txid needs no link and the page needs no component.
+        picked = st.dataframe(
+            txs, hide_index=True, width="stretch", height=min(38 * len(txs) + 40, 190),
+            on_select="rerun", selection_mode="single-row", key="tx_pick",
+            column_config={
+                "time": st.column_config.DatetimeColumn("broadcast", format="DD MMM HH:mm"),
+                "txid": st.column_config.TextColumn("transaction id", width="large"),
+                "amount": st.column_config.NumberColumn("out (BTC)", format="%.8f"),
+            })
+        rows = picked.selection["rows"]
+        if rows:
+            tx_detail(w.records[rows[0]], w)
+        else:
+            note("Nothing selected. Click a row to open the transaction.", pad=True)
+    else:
+        st.info("No transactions yet. Buy some coin, or run a demo behaviour.")
 
 with right, card("Push to btctrace"):
     note("Re-ingests the full corpus and re-runs detection over every wallet. Takes about "
