@@ -32,12 +32,21 @@ limitations these numbers carry.
 
 ## Quick start
 
+Needs Python 3.10+. Every command below runs from the project root.
+
 ```bash
-pip install -r requirements.txt     # or: make setup
-make demo                           # generate -> ingest -> detect -> evaluate
-make dashboard                      # http://localhost:8501
-make test                           # 6 checks, no test framework required
+python -m pip install -r requirements.txt   # once
+python -m btctrace.cli pipeline --scale 3   # demo: generate -> ingest -> detect -> evaluate (~40 s)
+python -m streamlit run app.py              # dashboard at http://localhost:8501 (run the demo first)
+python tests/test_pipeline.py               # 6 checks, no test framework required
 ```
+
+Run the demo before the dashboard — the dashboard reads `data/alerts.parquet`, which the
+pipeline writes.
+
+If you have `make` (Linux/macOS, or Git Bash with make installed), the same four steps are
+`make setup`, `make demo`, `make dashboard`, `make test`. On Windows use the commands above;
+`make` is not installed by default there.
 
 Optional GeoIP enrichment (the only step that uses the network, and it is a one-time setup):
 
