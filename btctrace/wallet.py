@@ -46,6 +46,9 @@ class Wallet:
         self.rng = self._g.rng
         self.label = label
         self.address = self._g._addr("p2wpkh")
+        # One person, many addresses. Receipts land on `address` so the account has a
+        # stable identity to look up, but change never comes back to it -- see _fresh.
+        self.addresses = [self.address]
         self.exchange = self._g._addr("p2sh")
         self.home = self._g._ip(NETWORKS[11])       # a plain domestic ISP
         self.ts = int(start_ts)
@@ -67,8 +70,21 @@ class Wallet:
         self.ts += int(seconds)
         return self.ts
 
-    def _credit(self, txid: str, amount: float, ts: int) -> None:
-        self.utxos.append({"txid": txid, "amount": round(amount, SATOSHI_DP), "ts": int(ts)})
+    def _fresh(self) -> str:
+        """A new address this wallet owns, for change to land on.
+
+        A spend consumes whole outputs, so the leftover has to be paid back somewhere.
+        Sending it to the address that just spent would tie every payment this wallet
+        ever makes to one public identifier, so wallets derive a fresh one each time --
+        which is why one person ends up owning thousands of addresses.
+        """
+        addr = self._g._addr("p2wpkh")
+        self.addresses.append(addr)
+        return addr
+
+    def _credit(self, txid: str, amount: float, ts: int, address: str | None = None) -> None:
+        self.utxos.append({"txid": txid, "amount": round(amount, SATOSHI_DP), "ts": int(ts),
+                           "address": address or self.address})
 
     def _select(self, target: float) -> list[dict]:
         """Coins to fund `target`, oldest first, or everything if that is not enough.
@@ -140,7 +156,7 @@ class Wallet:
         return dest
 
     def _spend(self, amount: float, dest: str, action: str, detail: str,
-               ip=None, log: bool = True) -> None:
+               ip=None, log: bool = True, change_to: str | None = None) -> None:
         """Fund `amount` from the coins on hand, paying the remainder back as change."""
         if amount > self.balance:
             raise ValueError(f"balance {self.balance:.8f} cannot cover {amount:.8f}")
@@ -153,15 +169,20 @@ class Wallet:
         change = round(funded - amount - fee, SATOSHI_DP)
         outs, amts = [dest], [amount]
         if change > 0:
-            outs.append(self.address)
+            # `change_to` reuses a given address instead of deriving one. Only geo_hop
+            # asks for that, because address reuse is what makes its legs one wallet.
+            outs.append(change_to or self._fresh())
             amts.append(change)
         ts = self._tick(self.rng.uniform(0.5, 6) * HOUR)
-        txid = self._row(ts, [self.address] * len(chosen),
+        # Coins may sit on several of this wallet's addresses, and spending them together
+        # is precisely the co-spend that features.entity_clusters uses to put the wallet
+        # back together from the outside.
+        txid = self._row(ts, [u["address"] for u in chosen],
                          [u["amount"] for u in chosen], outs, amts, ip=ip)
         for u in chosen:
             self.utxos.remove(u)
         if change > 0:
-            self._credit(txid, change, ts)
+            self._credit(txid, change, ts, outs[-1])
         if log:
             self._note(action, detail)
 
@@ -181,7 +202,7 @@ class Wallet:
         out_fee = self._fee()
         moved = round(self.balance - out_fee, SATOSHI_DP)
         self._row(self._tick(self.rng.uniform(4, 30) * 60),
-                  [self.address] * len(held), [u["amount"] for u in held],
+                  [u["address"] for u in held], [u["amount"] for u in held],
                   [self._g._addr()], [moved])
         self.utxos.clear()
         self._note("rapid pass-through", f"{n} receipts forwarded in under an hour")
@@ -197,6 +218,7 @@ class Wallet:
             self.buy(round(held - self.balance, SATOSHI_DP))
         coins = list(self.utxos)
         current, held = self.address, self.balance
+        ins0 = [u["address"] for u in coins]
         for hop in range(hops):
             fee = self._fee()
             peel = round(held * self.rng.uniform(0.08, 0.16), SATOSHI_DP)
@@ -204,7 +226,7 @@ class Wallet:
             nxt = self._g._addr("p2wpkh")
             # Only the first hop spends this wallet's coins; every hop after it spends
             # the single remainder output the hop before created.
-            ins = [current] * len(coins) if hop == 0 else [current]
+            ins = ins0 if hop == 0 else [current]
             amts = [u["amount"] for u in coins] if hop == 0 else [held]
             self._row(self._tick(self.rng.uniform(20, 90) * 60),
                       ins, amts, [self._g._addr(), nxt], [peel, remainder])
@@ -233,7 +255,7 @@ class Wallet:
                 break
             amt = round(self.balance * 0.3, SATOSHI_DP)
             self._spend(amt, self._g._addr(), "geo hop", "", ip=self._g._ip(net),
-                        log=False)
+                        log=False, change_to=self.address)
         self._note("geo hop", f"broadcast from {', '.join(n[0] for n in nets)}")
 
     # ---------- output ----------
@@ -281,7 +303,7 @@ def demo() -> None:
     import pandas as pd
 
     from .detect import typologies
-    from .features import wallet_features
+    from .features import entity_clusters, wallet_features
     from .ingest import load, validate
 
     start = int(pd.Timestamp("2025-01-01", tz="UTC").timestamp())
@@ -316,6 +338,18 @@ def demo() -> None:
     assert len(coins.utxos) == 1, f"change left {len(coins.utxos)} coins"
     assert abs(coins.balance - sum(u["amount"] for u in coins.utxos)) < 1e-9
     assert coins.balance < 0.2, f"change of {coins.balance} is too large"
+
+    # The change coin lands on a *fresh* address this wallet owns, not on the one that
+    # just spent -- and co-spending it later is what lets the common-input heuristic put
+    # the pieces back together from outside.
+    change_addr = spent["output_addresses"][1]
+    assert change_addr in coins.addresses, "change left the wallet"
+    assert change_addr not in spent["input_addresses"], "change reused the spending address"
+    coins.buy(0.3)
+    coins.send(0.4)                       # needs the change coin and the new one
+    assert len(coins.records[-1]["input_addresses"]) == 2, "did not co-spend two addresses"
+    merged = entity_clusters(pd.DataFrame(coins.records))
+    assert merged[coins.address] == merged[change_addr], "co-spend did not re-merge them"
     fanin = Wallet(start_ts=start, seed=10)
     fanin.fanin_collection()
     assert len(fanin.utxos) == FANIN_RECEIPTS, "a fan-in should leave one coin per payer"

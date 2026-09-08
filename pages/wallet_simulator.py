@@ -58,7 +58,10 @@ def new_wallet() -> Wallet:
 
 style()
 
-if "wallet" not in st.session_state:
+# Session state survives a hot reload, so a wallet built by an older version of this
+# module can outlive it. Checking for the attribute covers both "no wallet yet" and
+# "a wallet from before the code changed".
+if not hasattr(st.session_state.get("wallet"), "addresses"):
     st.session_state.wallet = new_wallet()
 w: Wallet = st.session_state.wallet
 
@@ -72,8 +75,9 @@ strip(
     cell("Balance", f"{w.balance:.4f}", "BTC"),
     cell("Unspent outputs", f"{len(w.utxos):,}", "coins"),
     cell("Transactions emitted", f"{len(w.records):,}"),
+    cell("Addresses owned", f"{len(w.addresses):,}"),
     cell("Live feed", "loaded" if LIVE_CSV.exists() else "not pushed"),
-    cell("Address", w.address, ident=True),
+    cell("Receiving address", w.address, ident=True),
 )
 
 left, right = st.columns([1, 1], gap="large")
@@ -118,16 +122,20 @@ with left, card("Trade"):
 with left, card("Unspent outputs"):
     note("What this wallet actually holds. A balance is a total; these are the coins "
          "behind it, and a payment spends whole coins and takes the remainder back as "
-         "change -- which is why a Send can consume several at once.")
+         "change -- which is why a Send can consume several at once. The change lands on "
+         "a fresh address the wallet owns, never the one that just spent, which is how "
+         "one person comes to own thousands of addresses.")
     if w.utxos:
         coins = pd.DataFrame(w.utxos)
         st.dataframe(
             coins.assign(received=pd.to_datetime(coins["ts"], unit="s"),
-                         txid=coins["txid"].str.slice(0, 12) + "…")
-            .sort_values("ts")[["amount", "txid", "received"]],
+                         txid=coins["txid"].str.slice(0, 12) + "…",
+                         held_at=coins["address"].str.slice(0, 14) + "…")
+            .sort_values("ts")[["amount", "held_at", "txid", "received"]],
             hide_index=True, width="stretch", height=min(38 * len(coins) + 40, 230),
             column_config={
                 "amount": st.column_config.NumberColumn("amount (BTC)", format="%.8f"),
+                "held_at": st.column_config.TextColumn("held at", width="small"),
                 "txid": st.column_config.TextColumn("from tx", width="small"),
                 "received": st.column_config.DatetimeColumn("received", format="DD MMM HH:mm"),
             })
@@ -169,11 +177,14 @@ with right, card("Push to btctrace"):
             save_records(w.records)
             out = rescore(DATA)
         alerts = out["alerts"].reset_index(drop=True)
-        hit = alerts.index[alerts["address"] == w.address]
+        # Change scatters this account across many addresses, so look up all of them
+        # and report the one the detector ranked highest.
+        hit = alerts.index[alerts["address"].isin(w.addresses)]
         st.session_state.result = {
             "rank": int(hit[0]) + 1 if len(hit) else None,
             "total": len(alerts),
             "row": alerts.loc[hit[0]] if len(hit) else None,
+            "scored": len(hit),
             "rejected": out["rejected"],
         }
         st.rerun()
@@ -210,6 +221,7 @@ with right, card("Push to btctrace"):
             f'<dt>Risk</dt><dd>{row["risk"]:.3f}</dd>'
             f'<dt>Confidence</dt><dd>{row["confidence"]:.3f}</dd>'
             f'<dt>Signals</dt><dd>{int(row["corroborating_families"])} of 3 families</dd>'
+            f'<dt>Addresses scored</dt><dd>{res["scored"]} of {len(w.addresses)}</dd>'
             f'<dt>Rows rejected</dt><dd>{res["rejected"]}</dd>'
             f'</dl><p class="bt-note" style="margin:16px 0 0">{verdict} Open the Console '
             'page to see this wallet in the ranked alert list, its evidence and its link '
