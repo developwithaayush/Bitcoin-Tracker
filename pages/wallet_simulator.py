@@ -14,7 +14,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from btctrace.ui import bar, cell, head, severity_of, strip, style
+from btctrace.ui import bar, card, cell, note, severity_of, strip, style
 from btctrace.wallet import LIVE_CSV, Wallet, rescore, save_records
 
 DATA = Path("data")
@@ -56,16 +56,6 @@ def new_wallet() -> Wallet:
     return Wallet(start_ts=corpus_end())
 
 
-def note(text: str, pad: bool = False) -> None:
-    """Explanatory line under a section head, in the console's quiet voice.
-
-    `pad` reserves two lines. Streamlit columns stack independently, so a one-line
-    caption beside a two-line one would knock the next row of buttons out of alignment.
-    """
-    height = ' style="min-height:2.9em"' if pad else ""
-    st.markdown(f'<p class="bt-note"{height}>{text}</p>', unsafe_allow_html=True)
-
-
 style()
 
 if "wallet" not in st.session_state:
@@ -80,36 +70,71 @@ bar("Wallet simulator",
 
 strip(
     cell("Balance", f"{w.balance:.4f}", "BTC"),
+    cell("Unspent outputs", f"{len(w.utxos):,}", "coins"),
     cell("Transactions emitted", f"{len(w.records):,}"),
-    cell("Actions logged", f"{len(w.log):,}"),
     cell("Live feed", "loaded" if LIVE_CSV.exists() else "not pushed"),
     cell("Address", w.address, ident=True),
 )
 
 left, right = st.columns([1, 1], gap="large")
 
-with left:
-    head("Trade", bare=True)
+with left, card("Trade"):
     note("Ordinary activity. A wallet that only buys, sells and pays should stay "
          "unremarkable to the detector -- that contrast is the point of the demo.")
-    amount_col, buy_col, sell_col, send_col = st.columns([2, 1, 1, 1],
-                                                         vertical_alignment="bottom")
+    amount_col, dest_col = st.columns([1, 2], vertical_alignment="bottom")
     amount = amount_col.number_input("Amount (BTC)", 0.0001, 100.0, 0.5, 0.1, format="%.4f")
+    # Buy comes from the exchange and Sell goes back to it, so only Send has a
+    # counterparty to name. Blank keeps the fast path: a random address, which is what
+    # the presets use and what this did before there was a field to fill in.
+    dest = dest_col.text_input(
+        "Send to address", placeholder="bc1q…  ·  blank for a random counterparty",
+        help="Where a Send pays. Buy and Sell always use the exchange.")
+
     broke = amount > w.balance
+    buy_col, sell_col, send_col, _ = st.columns([1, 1, 1, 2])
     if buy_col.button("Buy", width="stretch", type="primary"):
         w.buy(amount)
         st.rerun()
     if sell_col.button("Sell", width="stretch", disabled=broke):
         w.sell(amount)
         st.rerun()
+    bad_dest = ""
     if send_col.button("Send", width="stretch", disabled=broke):
-        w.send(amount)
-        st.rerun()
+        try:
+            # Rejecting the typo here is the whole point of asking: ingest checks IPs,
+            # ports and amounts but never address shape, so a bad one would reach the
+            # link graph as a node named after the mistake.
+            w.send(amount, dest.strip() or None)
+        except ValueError:
+            bad_dest = dest.strip()
+        else:
+            st.rerun()
+    if bad_dest:
+        note(f"{esc(bad_dest)} is not a Bitcoin address. Expected 1…, 3…, "
+             "bc1q… or bc1p…, or leave it blank.")
     if broke:
         note("Sell and Send need a balance -- buy some coin first.")
 
-    st.markdown("")
-    head("Demo behaviours", bare=True)
+with left, card("Unspent outputs"):
+    note("What this wallet actually holds. A balance is a total; these are the coins "
+         "behind it, and a payment spends whole coins and takes the remainder back as "
+         "change -- which is why a Send can consume several at once.")
+    if w.utxos:
+        coins = pd.DataFrame(w.utxos)
+        st.dataframe(
+            coins.assign(received=pd.to_datetime(coins["ts"], unit="s"),
+                         txid=coins["txid"].str.slice(0, 12) + "…")
+            .sort_values("ts")[["amount", "txid", "received"]],
+            hide_index=True, width="stretch", height=min(38 * len(coins) + 40, 230),
+            column_config={
+                "amount": st.column_config.NumberColumn("amount (BTC)", format="%.8f"),
+                "txid": st.column_config.TextColumn("from tx", width="small"),
+                "received": st.column_config.DatetimeColumn("received", format="DD MMM HH:mm"),
+            })
+    else:
+        note("No coins yet. A Buy creates one.")
+
+with left, card("Demo behaviours"):
     note("Each one emits a burst of activity shaped like the named typology, so the "
          "detector has something it is supposed to catch.")
     # Two columns: four full-width buttons in a stack read as an undifferentiated list,
@@ -122,8 +147,7 @@ with left:
                 st.rerun()
             note(esc(help_text), pad=True)
 
-with right:
-    head("Activity")
+with right, card("Activity"):
     if w.log:
         st.dataframe(pd.DataFrame(w.log)[["action", "detail", "balance"]],
                      hide_index=True, width="stretch", height=232,
@@ -134,7 +158,7 @@ with right:
     else:
         st.info("No activity yet. Buy some coin, or run one of the demo behaviours.")
 
-    head("Push to btctrace", bare=True)
+with right, card("Push to btctrace"):
     note("Re-ingests the full corpus and re-runs detection over every wallet. Takes about "
          "30 seconds: an anomaly score is a wallet's position in a population, so the "
          "population has to be scored with it.")
@@ -176,7 +200,7 @@ with right:
         verdict = ("This wallet reads as ordinary traffic: no typology fired."
                    if not tags else "Flagged by the rule layer as well as the model.")
         st.markdown(
-            '<div class="bt-panel" style="margin-top:16px">'
+            '<div class="bt-split"></div>'
             '<p class="bt-h">Detector verdict</p>'
             f'<div><span class="bt-sev"><i class="bt-dot" style="background:{sev_colour}">'
             f'</i>{sev_name}</span><span class="bt-meta"> &middot; '
@@ -189,7 +213,7 @@ with right:
             f'<dt>Rows rejected</dt><dd>{res["rejected"]}</dd>'
             f'</dl><p class="bt-note" style="margin:16px 0 0">{verdict} Open the Console '
             'page to see this wallet in the ranked alert list, its evidence and its link '
-            'graph.</p></div>',
+            'graph.</p>',
             unsafe_allow_html=True)
     elif res:
         st.warning("This wallet was not scored. Push again after emitting activity.")

@@ -23,6 +23,7 @@ render identically on an air-gapped machine, and the two renderers that cannot r
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from html import escape as esc
 
 import streamlit as st
@@ -195,6 +196,18 @@ html, body, [data-testid="stAppViewContainer"] {{
 .bt-note {{ font-size: 14px; font-weight: 400; line-height: 1.43; letter-spacing: -0.224px;
   color: var(--bt-ink-3); margin: 0 0 var(--sp-sm); }}
 .bt-quiet {{ color: var(--bt-ink-3); }}
+
+/* ---- Card: the store-utility-card grammar, wrapped around live widgets ----
+   Raw HTML cannot enclose Streamlit widgets, so the panel is drawn by marking the
+   container from the inside and selecting it with :has(). The marker is a direct child
+   of its own container's block and of no other, so an ancestor block cannot match it
+   and nest a second border around the first. */
+[data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] .bt-card) {{
+  background: var(--bt-panel); border: 1px solid var(--bt-line);
+  border-radius: var(--r-lg); padding: var(--sp-lg); }}
+[data-testid="stElementContainer"]:has(.bt-card) {{ display: none; }}
+/* A rule inside a card, for the one place a card holds two readings. */
+.bt-split {{ border-top: 1px solid var(--bt-line); margin: var(--sp-md) 0 var(--sp-sm); }}
 /* A qualifier trailing a primary reading -- the caption size, never smaller. */
 .bt-meta {{ font-size: 14px; letter-spacing: -0.224px; color: var(--bt-ink-3); }}
 .bt-addr {{ font-family: var(--bt-mono); font-size: 17px; font-weight: 400;
@@ -397,6 +410,27 @@ def bands(counts: dict[str, int]) -> None:
 def head(text: str, bare: bool = False) -> None:
     """A section label. `bare` tightens the gap when live widgets follow immediately."""
     st.markdown(f'<p class="bt-h{" bare" if bare else ""}">{text}</p>', unsafe_allow_html=True)
+
+
+def note(text: str, pad: bool = False) -> None:
+    """An explanatory line under a section head, in the console's quiet voice.
+
+    `pad` reserves two lines. Streamlit columns stack independently, so a one-line
+    caption beside a two-line one knocks the next row of controls out of alignment.
+    """
+    height = ' style="min-height:2.9em"' if pad else ""
+    st.markdown(f'<p class="bt-note"{height}>{text}</p>', unsafe_allow_html=True)
+
+
+@contextmanager
+def card(title: str = ""):
+    """A white panel around live widgets. Use as `with card("Trade"):`."""
+    box = st.container()
+    with box:
+        st.markdown('<span class="bt-card"></span>', unsafe_allow_html=True)
+        if title:
+            head(title)
+        yield box
 
 
 def _contrast(fg: str, bg: str) -> float:

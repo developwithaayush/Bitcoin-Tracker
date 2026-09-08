@@ -12,13 +12,23 @@ inputs do not pay out -- so every emitted row passes ingest validation.
 from __future__ import annotations
 
 import random
+import re
 from pathlib import Path
 
-from .generate import NETWORKS, Generator, write_csv
+from .generate import B32, B58, NETWORKS, Generator, write_csv
 from .schema import SATOSHI_DP
 
 HOUR = 3600
 LIVE_CSV = Path("data/raw/live.csv")
+
+# A destination typed by a presenter is the one value in this module that does not come
+# from the generator, and ingest validates IPs, ports, txids and amounts but never
+# address shape -- so a typo would sail through and land in the link graph as a node
+# named after the typo. Lengths are the real Bitcoin ranges rather than the exact ones
+# _addr emits, so a genuine address pasted from elsewhere is still accepted.
+ADDRESS_RE = re.compile(
+    rf"(?:[13][{B58}]{{25,34}}|bc1q[{B32}]{{38,58}}|bc1p[{B32}]{{38,58}})"
+)
 
 # Preset sizes are chosen against the population percentiles detect.typologies uses:
 # n_receives fires at >= 10, burst_max_24h at >= 4, peel_chain_depth at >= 5.
@@ -39,9 +49,17 @@ class Wallet:
         self.exchange = self._g._addr("p2sh")
         self.home = self._g._ip(NETWORKS[11])       # a plain domestic ISP
         self.ts = int(start_ts)
-        self.balance = 0.0
+        # A wallet holds coins as discrete unspent outputs, not as a number. Modelling
+        # that is what lets a spend consume several of them at once, which is the shape
+        # real Bitcoin transactions have and the shape the features are written against.
+        self.utxos: list[dict] = []
         self.records: list = []
         self.log: list = []
+
+    @property
+    def balance(self) -> float:
+        """Derived, never assigned: the coins are the truth, the total is a reading."""
+        return round(sum(u["amount"] for u in self.utxos), SATOSHI_DP)
 
     # ---------- primitives ----------
 
@@ -49,18 +67,39 @@ class Wallet:
         self.ts += int(seconds)
         return self.ts
 
-    def _row(self, ts, ins, in_amts, outs, out_amts, ip=None) -> None:
+    def _credit(self, txid: str, amount: float, ts: int) -> None:
+        self.utxos.append({"txid": txid, "amount": round(amount, SATOSHI_DP), "ts": int(ts)})
+
+    def _select(self, target: float) -> list[dict]:
+        """Coins to fund `target`, oldest first, or everything if that is not enough.
+
+        ponytail: FIFO, not branch-and-bound. It is what a simple wallet does, it is
+        stable across runs so a demo repeats, and it produces the multi-input spends
+        that make the emitted transactions look real. Swap in a smarter selector only
+        if the change-output pattern itself ever becomes the thing being detected.
+        """
+        chosen: list[dict] = []
+        total = 0.0
+        for u in sorted(self.utxos, key=lambda u: u["ts"]):
+            chosen.append(u)
+            total = round(total + u["amount"], SATOSHI_DP)
+            if total >= target:
+                break
+        return chosen
+
+    def _row(self, ts, ins, in_amts, outs, out_amts, ip=None) -> str:
         """One observation. The fee absorbs the difference, as a real transaction does."""
         src_ip, country, asn = ip or self.home
         in_amts = [round(v, SATOSHI_DP) for v in in_amts]
         out_amts = [round(v, SATOSHI_DP) for v in out_amts]
+        txid = self._g._txid()
         self.records.append({
             "timestamp": int(ts),
             "src_ip": src_ip,
             "dst_ip": self._g._ip()[0],
             "src_port": 8333,
             "dst_port": 8333,
-            "txid": self._g._txid(),
+            "txid": txid,
             "input_addresses": list(ins),
             "output_addresses": list(outs),
             "input_amounts": in_amts,
@@ -70,6 +109,7 @@ class Wallet:
             "geo_country": country,
             "asn": asn,
         })
+        return txid
 
     def _note(self, action: str, detail: str) -> None:
         self.log.append({"action": action, "detail": detail, "balance": round(self.balance, 8)})
@@ -80,11 +120,11 @@ class Wallet:
     # ---------- manual actions ----------
 
     def buy(self, amount: float) -> None:
-        """Exchange pays into this wallet."""
+        """Exchange pays into this wallet, creating one new unspent output."""
         fee = self._fee()
-        self._row(self._tick(self.rng.uniform(0.5, 6) * HOUR),
-                  [self.exchange], [amount + fee], [self.address], [amount])
-        self.balance = round(self.balance + amount, SATOSHI_DP)
+        ts = self._tick(self.rng.uniform(0.5, 6) * HOUR)
+        txid = self._row(ts, [self.exchange], [amount + fee], [self.address], [amount])
+        self._credit(txid, amount, ts)
         self._note("buy", f"{amount:.4f} BTC from exchange")
 
     def sell(self, amount: float) -> None:
@@ -92,24 +132,38 @@ class Wallet:
         self._spend(amount, self.exchange, "sell", f"{amount:.4f} BTC to exchange")
 
     def send(self, amount: float, dest: str | None = None) -> str:
-        """Ordinary payment to a counterparty."""
+        """Ordinary payment to a counterparty. `dest` None picks a random one."""
+        if dest is not None and not ADDRESS_RE.fullmatch(dest):
+            raise ValueError(f"{dest!r} is not a Bitcoin address")
         dest = dest or self._g._addr()
         self._spend(amount, dest, "send", f"{amount:.4f} BTC to {dest[:12]}...")
         return dest
 
-    def _spend(self, amount: float, dest: str, action: str, detail: str) -> None:
+    def _spend(self, amount: float, dest: str, action: str, detail: str,
+               ip=None, log: bool = True) -> None:
+        """Fund `amount` from the coins on hand, paying the remainder back as change."""
         if amount > self.balance:
             raise ValueError(f"balance {self.balance:.8f} cannot cover {amount:.8f}")
         fee = self._fee()
-        change = round(self.balance - amount - fee, SATOSHI_DP)
+        chosen = self._select(round(amount + fee, SATOSHI_DP))
+        funded = round(sum(u["amount"] for u in chosen), SATOSHI_DP)
+        # The coins may cover the payment but not the payment plus the fee. A real
+        # wallet then simply pays a smaller fee rather than failing, and _row derives
+        # the fee from what the inputs do not pay out, so this needs no special case.
+        change = round(funded - amount - fee, SATOSHI_DP)
         outs, amts = [dest], [amount]
         if change > 0:
             outs.append(self.address)
             amts.append(change)
-        self._row(self._tick(self.rng.uniform(0.5, 6) * HOUR),
-                  [self.address], [self.balance], outs, amts)
-        self.balance = max(0.0, change)
-        self._note(action, detail)
+        ts = self._tick(self.rng.uniform(0.5, 6) * HOUR)
+        txid = self._row(ts, [self.address] * len(chosen),
+                         [u["amount"] for u in chosen], outs, amts, ip=ip)
+        for u in chosen:
+            self.utxos.remove(u)
+        if change > 0:
+            self._credit(txid, change, ts)
+        if log:
+            self._note(action, detail)
 
     # ---------- preset behaviours ----------
 
@@ -118,14 +172,18 @@ class Wallet:
         for _ in range(n):
             amt = round(self.rng.uniform(0.4, 2.5), SATOSHI_DP)
             fee = self._fee()
-            self._row(self._tick(self.rng.uniform(6, 40) * 60),
-                      [self._g._addr()], [amt + fee], [self.address], [amt])
-            self.balance = round(self.balance + amt, SATOSHI_DP)
+            ts = self._tick(self.rng.uniform(6, 40) * 60)
+            txid = self._row(ts, [self._g._addr()], [amt + fee], [self.address], [amt])
+            self._credit(txid, amt, ts)
+        # Forwarding sweeps every coin into one transaction, which is exactly what a
+        # consolidating pass-through looks like on chain.
+        held = list(self.utxos)
         out_fee = self._fee()
         moved = round(self.balance - out_fee, SATOSHI_DP)
         self._row(self._tick(self.rng.uniform(4, 30) * 60),
-                  [self.address], [self.balance], [self._g._addr()], [moved])
-        self.balance = 0.0
+                  [self.address] * len(held), [u["amount"] for u in held],
+                  [self._g._addr()], [moved])
+        self.utxos.clear()
         self._note("rapid pass-through", f"{n} receipts forwarded in under an hour")
 
     def peeling_chain(self, hops: int = PEEL_HOPS) -> None:
@@ -137,16 +195,21 @@ class Wallet:
         held = round(max(self.balance, 4.0), SATOSHI_DP)
         if held > self.balance:                # top up so the chain has something to peel
             self.buy(round(held - self.balance, SATOSHI_DP))
+        coins = list(self.utxos)
         current, held = self.address, self.balance
-        for _ in range(hops):
+        for hop in range(hops):
             fee = self._fee()
             peel = round(held * self.rng.uniform(0.08, 0.16), SATOSHI_DP)
             remainder = round(held - peel - fee, SATOSHI_DP)
             nxt = self._g._addr("p2wpkh")
+            # Only the first hop spends this wallet's coins; every hop after it spends
+            # the single remainder output the hop before created.
+            ins = [current] * len(coins) if hop == 0 else [current]
+            amts = [u["amount"] for u in coins] if hop == 0 else [held]
             self._row(self._tick(self.rng.uniform(20, 90) * 60),
-                      [current], [held], [self._g._addr(), nxt], [peel, remainder])
+                      ins, amts, [self._g._addr(), nxt], [peel, remainder])
             current, held = nxt, remainder
-        self.balance = 0.0
+        self.utxos.clear()
         self._note("peeling chain", f"{hops} hops, remainder now at {current[:12]}...")
 
     def fanin_collection(self, n: int = FANIN_RECEIPTS) -> None:
@@ -155,9 +218,9 @@ class Wallet:
         for _ in range(n):
             amt = round(base * self.rng.uniform(0.97, 1.03), SATOSHI_DP)
             fee = self._fee()
-            self._row(self._tick(self.rng.uniform(20, 100) * 60),
-                      [self._g._addr()], [amt + fee], [self.address], [amt])
-            self.balance = round(self.balance + amt, SATOSHI_DP)
+            ts = self._tick(self.rng.uniform(20, 100) * 60)
+            txid = self._row(ts, [self._g._addr()], [amt + fee], [self.address], [amt])
+            self._credit(txid, amt, ts)
         self._note("fan-in collection", f"{n} near-identical receipts of ~{base:.4f} BTC")
 
     def geo_hop(self, legs: int = GEOHOP_LEGS) -> None:
@@ -168,16 +231,9 @@ class Wallet:
         for net in nets:
             if self.balance <= 0:
                 break
-            fee = self._fee()
             amt = round(self.balance * 0.3, SATOSHI_DP)
-            change = round(self.balance - amt - fee, SATOSHI_DP)
-            outs, amts = [self._g._addr()], [amt]
-            if change > 0:
-                outs.append(self.address)
-                amts.append(change)
-            self._row(self._tick(self.rng.uniform(30, 200) * 60),
-                      [self.address], [self.balance], outs, amts, ip=self._g._ip(net))
-            self.balance = max(0.0, change)
+            self._spend(amt, self._g._addr(), "geo hop", "", ip=self._g._ip(net),
+                        log=False)
         self._note("geo hop", f"broadcast from {', '.join(n[0] for n in nets)}")
 
     # ---------- output ----------
@@ -248,6 +304,38 @@ def demo() -> None:
     clean.sell(0.3)
     wallets["clean"] = clean
 
+    # Coins, not a running total: two receipts are two spendable outputs, a payment that
+    # needs both spends both, and the leftover comes back as exactly one change coin.
+    coins = Wallet(start_ts=start, seed=9)
+    coins.buy(0.5)
+    coins.buy(0.4)
+    assert len(coins.utxos) == 2, f"two buys made {len(coins.utxos)} coins"
+    coins.send(0.7)                       # neither coin covers this alone
+    spent = coins.records[-1]
+    assert len(spent["input_amounts"]) == 2, "payment did not consume both coins"
+    assert len(coins.utxos) == 1, f"change left {len(coins.utxos)} coins"
+    assert abs(coins.balance - sum(u["amount"] for u in coins.utxos)) < 1e-9
+    assert coins.balance < 0.2, f"change of {coins.balance} is too large"
+    fanin = Wallet(start_ts=start, seed=10)
+    fanin.fanin_collection()
+    assert len(fanin.utxos) == FANIN_RECEIPTS, "a fan-in should leave one coin per payer"
+    wallets["coins"] = coins
+
+    # A named destination is paid, and a mistyped one is refused rather than quietly
+    # becoming a node in the link graph.
+    payee = Wallet(start_ts=start, seed=11)
+    named = Wallet(start_ts=start, seed=12)
+    named.buy(1.0)
+    named.send(0.25, payee.address)
+    assert payee.address in named.records[-1]["output_addresses"], "named payee not paid"
+    for junk in ("", "aayush", "bc1q!!!", "4" + "x" * 30, payee.address + "z" * 40):
+        try:
+            named.send(0.1, junk)
+        except ValueError:
+            continue
+        raise AssertionError(f"{junk!r} was accepted as an address")
+    wallets["named"] = named
+
     records = [r for w in wallets.values() for r in w.records]
     path = save_records(records, Path(tempfile.mkdtemp()) / "live.csv")
 
@@ -256,13 +344,15 @@ def demo() -> None:
     assert len(good) == len(records), f"{len(good)} of {len(records)} rows survived"
 
     tags = typologies(wallet_features(good))
+    ordinary = {"clean", "named", "coins"}   # manual trading, so nothing should fire
     for tag, w in wallets.items():
         got = tags.get(w.address, [])
-        if tag == "clean":
-            assert not got, f"plain buy/sell wallet was tagged {got}"
+        if tag in ordinary:
+            assert not got, f"{tag} buy/sell wallet was tagged {got}"
         else:
             assert tag in got, f"{tag} preset produced {got or 'no typology'}"
-    print(f"PASS  wallet presets fire their typologies, {len(records)} rows, 0 rejected")
+    print(f"PASS  presets fire their typologies, addresses validated, "
+          f"{len(records)} rows, 0 rejected")
 
 
 if __name__ == "__main__":
