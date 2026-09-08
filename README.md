@@ -48,6 +48,46 @@ If you have `make` (Linux/macOS, or Git Bash with make installed), the same four
 `make setup`, `make demo`, `make dashboard`, `make test`. On Windows use the commands above;
 `make` is not installed by default there.
 
+## Live demo: wallet simulator
+
+A second page in the dashboard, for showing the detector working in front of an audience.
+It is a sandbox account that buys, sells and sends fake bitcoin; its transactions are
+written to `data/raw/live.csv` and picked up by the ordinary ingest path, so nothing in
+the pipeline treats them specially.
+
+```bash
+python -m btctrace.cli pipeline --scale 3   # build the baseline corpus first
+python -m streamlit run app.py              # sidebar -> "Wallet simulator"
+```
+
+Buy and sell normally and the wallet stays unflagged. Run one of the preset behaviours and
+it acts out a laundering pattern the detector is built to catch:
+
+| Preset | What it emits | Typology it should trigger |
+|---|---|---|
+| Rapid pass-through | four receipts, all forwarded within the hour | `rapid_passthrough` |
+| Peeling chain | eight hops, a small payment peeled off each | `peeling_chain` |
+| Fan-in collection | twelve near-identical receipts in one day | `ransomware_fanin` |
+| Geo hopping | spends broadcast from five countries in a day | `geo_hopping` |
+
+**Analyse now** re-ingests and re-scores, then reports where your wallet ranked among all
+~34,000. Measured against the standard corpus, the four presets land at ranks 138, 423,
+239 and 10 with the correct typology attached, while a plain buy/sell wallet draws no
+typology at all — that contrast is the demo.
+
+The re-score takes about 30 seconds and there is no shortcut: an IsolationForest score is
+a statement about a wallet's position in a population, so the population is scored with
+it. Open the console in a second browser tab to watch the alert list change.
+
+**Reset** clears the live feed and re-scores back to the baseline. Do that before quoting
+the headline metrics — live wallets are not in `ground_truth.csv`, so while a live feed is
+loaded the Model performance tab counts them as false positives.
+
+Verify the simulator on its own with `python -m btctrace.wallet`, which checks that every
+emitted row survives ingest validation and that each preset fires its intended typology.
+
+---
+
 Optional GeoIP enrichment (the only step that uses the network, and it is a one-time setup):
 
 ```bash
@@ -119,8 +159,10 @@ btctrace/
   ingest.py     parsing, validation, GeoIP enrichment
   features.py   entity graph, co-spend clustering, 28-feature wallet matrix
   detect.py     IsolationForest + DBSCAN + typology motifs + attribution
+  wallet.py     demo wallet simulator -> data/raw/live.csv
   cli.py        command line
 app.py          Streamlit dashboard
+pages/          extra dashboard pages (wallet simulator)
 tests/          six end-to-end checks
 scripts/        GeoIP downloader
 ```
