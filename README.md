@@ -99,6 +99,41 @@ for want of a GeoIP database.
 
 ---
 
+## Real Bitcoin data
+
+Everything above runs on the synthetic corpus. To put genuine mainnet data on screen:
+
+```bash
+python -m btctrace.live --mode all --limit 30    # real transactions + real node addresses
+python -m btctrace.live --mode probe             # can this network speak the p2p protocol?
+```
+
+`--mode all` writes `data/live/transactions.json` (unconfirmed mainnet transactions --
+txid, addresses, amounts, fee, pulled from a public Esplora mirror) and
+`data/live/nodes.csv` (live node addresses from the Bitcoin DNS seeds, with country and
+ASN per IP). The **P2P broadcast** page uses them automatically when present, and its
+*Fetch live* button re-pulls without leaving the browser. Every hash on that page can be
+checked on any block explorer while the demo is running.
+
+What stays modelled is **which node announced a transaction, and when each peer heard
+it**. No public API publishes that -- the chain records what happened, never who said it
+-- so the only way to observe it is to be on the network:
+
+```bash
+python -m btctrace.live --mode p2p --seconds 60 --peers 8
+```
+
+This handshakes with real peers and records their `inv` announcements, giving real
+first-seen IPs and millisecond timings, with no blockchain download. It needs a network
+that does not filter the protocol. `--mode probe` tells you in seconds: it connects to
+real peers, sends arbitrary bytes (accepted), then a real `version` message. If only the
+second is reset, the link is blocking Bitcoin by signature -- some ISPs do -- and a
+mobile hotspot or VPN is the fix.
+
+Live data is deliberately kept out of `data/raw/`, so it never enters the detection
+corpus: an anomaly score is a wallet's position in a labelled population, and these rows
+have no ground truth and no observed network layer to score.
+
 ## Air-gapped install
 
 On a connected machine:

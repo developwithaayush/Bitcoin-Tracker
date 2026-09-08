@@ -13,6 +13,7 @@ route the gossip took. The page says so on the page rather than only in this doc
 
 from __future__ import annotations
 
+import json
 import math
 import random
 from html import escape as esc
@@ -22,6 +23,7 @@ import pandas as pd
 import streamlit as st
 
 from btctrace.generate import NETWORKS, Generator
+from btctrace.live import REAL_NODES, REAL_TXS
 from btctrace.ui import (INK, INK_3, LINE, NEUTRAL, PANEL, RED, bar, card, cell, note,
                         strip, style)
 
@@ -99,12 +101,47 @@ svg.dragging { cursor: grabbing; }
 """
 
 
+@st.cache_data(ttl=120)
+def live_nodes() -> list[tuple[str, str, int]]:
+    """Addresses of real Bitcoin nodes, if a capture has been pulled."""
+    if not REAL_NODES.exists():
+        return []
+    import csv
+
+    with REAL_NODES.open(encoding="utf-8") as fh:
+        return [(r["ip"], r["country"], int(r["asn"])) for r in csv.DictReader(fh)]
+
+
+@st.cache_data(ttl=120)
+def live_txs() -> list[dict]:
+    """Real mainnet transactions pulled from a public Esplora mirror."""
+    if not REAL_TXS.exists():
+        return []
+    return [{"txid": t["txid"], "timestamp": t["seen_at"],
+             "amount": sum(a for _, a in t["outputs"]),
+             "n_in": len(t["inputs"]), "n_out": len(t["outputs"]),
+             "inputs": [(a, v) for a, v in t["inputs"]],
+             "outputs": [(a, v) for a, v in t["outputs"]],
+             "fee": t["fee"], "confirmed": t["confirmed"], "real": True,
+             "origin": "live mainnet"} for t in json.loads(REAL_TXS.read_text("utf-8"))]
+
+
 def sources() -> list[dict]:
     """Transactions to choose from: the live wallet if the simulator has one, else the corpus.
 
     Session state is shared across pages, so a transaction just emitted next door is
     already here -- no file to write and re-read.
     """
+    live = live_txs()
+    if live:
+        # A real transaction carries no announcing IP -- nothing public does. The origin
+        # shown is a real node, chosen deterministically per txid, and the page says so.
+        pool = live_nodes()
+        for t in live:
+            ip, country, asn = (pool[int(t["txid"][:8], 16) % len(pool)] if pool
+                                else ("0.0.0.0", "??", 0))
+            t.update(src_ip=ip, geo_country=country, asn=asn)
+        return live
     w = st.session_state.get("wallet")
     if w is not None and getattr(w, "records", None):
         return [{"txid": r["txid"], "timestamp": r["timestamp"],
@@ -127,7 +164,7 @@ def sources() -> list[dict]:
              "origin": "corpus"} for r in df.itertuples(index=False)]
 
 
-def gossip(tx: dict) -> list[dict]:
+def gossip(tx: dict, pool: list | None = None) -> tuple[list[dict], list[tuple[int, int]]]:
     """Lay the origin and its peers out in rings, one ring per hop, and time the relays.
 
     Seeded from the txid, so replaying the same transaction draws the same network -- a
@@ -141,7 +178,8 @@ def gossip(tx: dict) -> list[dict]:
     for hop, count in enumerate(RINGS, start=1):
         ring, base = [], rng.uniform(0, math.tau)
         for i in range(count):
-            ip, country, asn = gen._ip(rng.choice(NETWORKS))
+            ip, country, asn = (tuple(rng.choice(pool)) if pool
+                                else gen._ip(rng.choice(NETWORKS)))
             angle = base + i * math.tau / count + rng.uniform(-0.18, 0.18)
             radius = RADII[hop] * rng.uniform(0.92, 1.08)
             parent = rng.choice(previous)
@@ -322,16 +360,34 @@ if not txs:
 
 labels = [f'{t["txid"][:12]}…  ·  {t["amount"]:.4f} BTC  ·  '
           f'{t["geo_country"]} · AS{t["asn"]}' for t in txs]
-pick, replay = st.columns([4, 1], vertical_alignment="bottom")
+real = txs[0].get("real", False)
+pick, replay, refresh = st.columns([4, 1, 1], vertical_alignment="bottom")
 choice = pick.selectbox(f"Transaction ({txs[0]['origin']})", range(len(txs)),
                         format_func=lambda i: labels[i])
 # Re-rendering with a different marker replaces the SVG node, and the browser restarts
 # every animation on it. That is the whole replay mechanism.
 if replay.button("Replay", width="stretch", type="primary"):
     st.session_state.p2p_run = st.session_state.get("p2p_run", 0) + 1
+# Pulling live in front of an audience is the point: these transactions are in the
+# mempool right now and can be checked on any explorer while the page is open.
+if refresh.button("Fetch live", width="stretch",
+                  help="Pull fresh unconfirmed transactions and node addresses off the "
+                       "real Bitcoin network."):
+    from btctrace.live import real_nodes, real_transactions
+    with st.spinner("Reading the live mempool and resolving node addresses…"):
+        try:
+            got = real_transactions(20)
+            real_nodes(30)
+            live_txs.clear()
+            live_nodes.clear()
+            st.session_state.p2p_run = st.session_state.get("p2p_run", 0) + 1
+            st.success(f'Pulled {got["transactions"]} live transactions.')
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Live fetch failed: {exc}")
 
 tx = txs[choice]
-nodes, idle = gossip(tx)
+nodes, idle = gossip(tx, live_nodes())
 last = max(n["delay"] for n in nodes)
 
 strip(
@@ -339,8 +395,8 @@ strip(
     cell("Shape", f'{tx["n_in"]} in / {tx["n_out"]} out'),
     cell("Nodes reached", f"{len(nodes)}"),
     cell("Full propagation", f"{last / 1000:.2f}", "s"),
-    cell("Announced by", f'{tx["src_ip"]} · {tx["geo_country"]} · AS{tx["asn"]}',
-         ident=True),
+    cell("Announced by" if not real else "Origin node (modelled)",
+         f'{tx["src_ip"]} · {tx["geo_country"]} · AS{tx["asn"]}', ident=True),
 )
 
 with card("Gossip"):
@@ -365,13 +421,24 @@ with left, card("Relay order"):
         hide_index=True, width="stretch", height=330,
         column_config={"peer": st.column_config.TextColumn(width="medium")})
 
-with right, card("What the judges should take from this"):
-    note("Real: the transaction, its amount, and the announcing host's IP, country and "
-         "ASN. Those come from the corpus (or from a wallet you just used next door) and "
-         "are exactly the values the network features are computed over.")
-    note("Simulated: the peers and the timings. A capture records the announcement a "
-         "sensor saw, never the path the gossip took -- so the rings here illustrate the "
-         "mechanism, they are not claimed observations.", pad=True)
+with right, card("What is real here"):
+    if real:
+        note("This transaction is real and unconfirmed on Bitcoin mainnet: the txid, the "
+             "addresses, the amounts and the fee came from a public Esplora mirror "
+             "minutes ago. Paste the hash into any block explorer and it is there.")
+        note("The nodes are real too -- their addresses come from the Bitcoin DNS seeds, "
+             "the same bootstrap every new node uses, with country and ASN resolved per "
+             "IP. These machines are running the network right now.", pad=True)
+        note("Modelled: which node announced it, and the relay timings. No public source "
+             "publishes that, and this network resets any connection carrying the "
+             "Bitcoin protocol -- `python -m btctrace.live --mode probe` demonstrates it "
+             "packet by packet. On an unfiltered link, --mode p2p captures the real "
+             "announcements instead.", pad=True)
+    else:
+        note("Real: the transaction, its amount, and the announcing host's IP, country "
+             "and ASN, straight from the corpus or from a wallet you used next door.")
+        note("Modelled: the peers and the timings. A capture records the announcement a "
+             "sensor saw, never the path the gossip took.", pad=True)
     st.markdown(
         '<dl class="bt-dl">'
         f'<dt>Announcing IP</dt><dd class="mono">{esc(tx["src_ip"])}</dd>'
