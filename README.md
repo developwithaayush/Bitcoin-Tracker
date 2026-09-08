@@ -160,8 +160,9 @@ btctrace/
   features.py   entity graph, co-spend clustering, 28-feature wallet matrix
   detect.py     IsolationForest + DBSCAN + typology motifs + attribution
   wallet.py     demo wallet simulator -> data/raw/live.csv
+  ui.py         palette, stylesheet and HTML helpers shared by every page
   cli.py        command line
-app.py          Streamlit dashboard
+app.py          Streamlit dashboard: page config, navigation, console page
 pages/          extra dashboard pages (wallet simulator)
 tests/          six end-to-end checks
 scripts/        GeoIP downloader
