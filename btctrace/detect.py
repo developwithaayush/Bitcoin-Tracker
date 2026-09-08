@@ -119,19 +119,49 @@ def cohorts(X: np.ndarray, eps: float = 1.4, min_samples: int = 12) -> np.ndarra
     return DBSCAN(eps=eps, min_samples=min_samples, n_jobs=-1).fit_predict(reduced)
 
 
-def typologies(raw: pd.DataFrame) -> pd.Series:
-    """Named graph/network motifs, as corroborating evidence rather than as the score.
+# The features each typology reads, so a dashboard can show a rule's terms and the value
+# it saw without restating the rule itself and drifting from it.
+TYPOLOGY_TERMS = {
+    "peeling_chain": ["peel_chain_depth"],
+    "mixer_layering": ["max_tx_fanout", "retention_ratio"],
+    "ransomware_fanin": ["n_receives", "uniformity_received", "burst_max_24h"],
+    "rapid_passthrough": ["hop_latency_h", "retention_ratio", "n_receives"],
+    "sybil_broadcast": ["ip_cohort_components"],
+    "geo_hopping": ["n_asns", "geo_hop_rate"],
+}
 
-    Thresholds are percentiles of the observed population, not hard-coded constants, so
-    the detectors travel to a dataset with a different scale without retuning.
+
+def thresholds(raw: pd.DataFrame) -> dict:
+    """The cut-offs the rule layer is using on this population.
+
+    Percentiles of the observed data, not hard-coded constants, so the detectors travel
+    to a dataset with a different scale without retuning. A floor keeps a tiny or unusually
+    quiet population from producing a threshold that fires on ordinary behaviour.
     """
     def p(col, q):
         return raw[col].quantile(q) if col in raw else np.inf
 
-    hot_fanout = max(6, p("max_tx_fanout", 0.995))
-    burst = max(4, p("burst_max_24h", 0.99))
-    many_recv = max(10, p("n_receives", 0.99))
-    fragmented = max(8, p("ip_cohort_components", 0.995))
+    return {
+        "max_tx_fanout": max(6, p("max_tx_fanout", 0.995)),
+        "burst_max_24h": max(4, p("burst_max_24h", 0.99)),
+        "n_receives": max(10, p("n_receives", 0.99)),
+        "ip_cohort_components": max(8, p("ip_cohort_components", 0.995)),
+        "peel_chain_depth": 5,
+        "uniformity_received": 0.8,
+        "hop_latency_h": 1.0,
+        "retention_ratio": 0.1,
+        "n_asns": 4,
+        "geo_hop_rate": 1.0,
+    }
+
+
+def typologies(raw: pd.DataFrame) -> pd.Series:
+    """Named graph/network motifs, as corroborating evidence rather than as the score."""
+    t = thresholds(raw)
+    hot_fanout = t["max_tx_fanout"]
+    burst = t["burst_max_24h"]
+    many_recv = t["n_receives"]
+    fragmented = t["ip_cohort_components"]
 
     quick = (raw["hop_latency_h"] >= 0) & (raw["hop_latency_h"] < 1.0)
     drains = raw["retention_ratio"].abs() < 0.1
